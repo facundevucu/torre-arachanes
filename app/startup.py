@@ -60,7 +60,7 @@ async def run_startup_recovery() -> None:
     messages = await waha.get_messages_since(last_ts)
 
     # Filter to authorized sender only (accept both @c.us and @lid), exclude fromMe
-    authorized_ids = {settings.AUTHORIZED_NUMBER}
+    authorized_ids = set(settings.AUTHORIZED_NUMBERS)
     if settings.AUTHORIZED_LID:
         authorized_ids.add(settings.AUTHORIZED_LID)
     missed = [
@@ -70,27 +70,27 @@ async def run_startup_recovery() -> None:
 
     if not missed:
         if last_ts:
-            # Had previous messages but nothing new — clean start
             logger.info("No missed messages since last run.")
         else:
-            # First ever run or empty history
-            await waha.send_text(
-                settings.AUTHORIZED_NUMBER,
-                "Bot reiniciado. Si mandaste mensajes mientras estaba caído, reenviálos.",
-            )
+            for jid in settings.AUTHORIZED_NUMBERS:
+                await waha.send_text(
+                    jid,
+                    "Bot reiniciado. Si mandaste mensajes mientras estaba caído, reenviálos.",
+                )
         return
 
-    logger.info("Found %d missed message(s) from %s.", len(missed), authorized)
+    logger.info("Found %d missed message(s).", len(missed))
 
     # 4. Check for pending draft
     pending = get_pending()
     if pending:
-        logger.info("Pending draft exists (id=%s). Notifying father.", pending["message_id"])
-        await waha.send_text(
-            settings.AUTHORIZED_NUMBER,
-            "El bot reinició y hay un borrador pendiente. "
-            "Respondé 'ok' para publicar o 'cancelar' para descartar antes de continuar.",
-        )
+        logger.info("Pending draft exists (id=%s). Notifying.", pending["message_id"])
+        for jid in settings.AUTHORIZED_NUMBERS:
+            await waha.send_text(
+                jid,
+                "El bot reinició y hay un borrador pendiente. "
+                "Respondé 'ok' para publicar o 'cancelar' para descartar antes de continuar.",
+            )
         return
 
     # 5. Replay missed messages in order
