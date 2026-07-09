@@ -6,7 +6,7 @@ import pytest
 
 # Set required env vars before any app module is imported
 os.environ.setdefault("AUTHORIZED_NUMBER", "549TEST1@c.us")
-os.environ.setdefault("GROUP_JID", "120363409010865500@g.us")
+os.environ.setdefault("GROUP_JID", "120363000000000001@g.us")
 os.environ.setdefault("CLAUDE_API_KEY", "sk-ant-test")
 os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
 os.environ.setdefault("WAHA_API_KEY", "test-waha-key")

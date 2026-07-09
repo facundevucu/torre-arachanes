@@ -25,6 +25,7 @@ def _text_payload(body: str, from_number: str = "549TEST1@c.us", msg_id: str = "
     }
 
 
+
 def _pdf_payload(msg_id: str = "pdf-001", media_url: str = "http://waha-test:3000/media/pdf-001") -> dict:
     return {
         "event": "message",
@@ -41,45 +42,17 @@ def _pdf_payload(msg_id: str = "pdf-001", media_url: str = "http://waha-test:300
     }
 
 
-# ─── Webhook auth ─────────────────────────────────────────────────────────────
+# ─── Webhook accepts any POST (no token auth — Docker network is the boundary) ─
 
 @pytest.mark.asyncio
-async def test_invalid_token_returns_401():
-    from httpx import AsyncClient
-    from app.main import app
-
-    async with AsyncClient(app=app, base_url="http://test") as client:
-        r = await client.post(
-            "/webhook",
-            json=_text_payload("hola"),
-            headers={"x-hook-token": "wrong-token"},
-        )
-    assert r.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_missing_token_returns_401():
-    from httpx import AsyncClient
-    from app.main import app
-
-    async with AsyncClient(app=app, base_url="http://test") as client:
-        r = await client.post("/webhook", json=_text_payload("hola"))
-    assert r.status_code == 401
-
-
-@pytest.mark.asyncio
-async def test_valid_token_returns_200():
+async def test_webhook_returns_200():
     from httpx import AsyncClient
     from app.main import app
 
     with patch("app.webhook.waha.send_text", AsyncMock(return_value=True)), \
          patch("app.webhook.format_message", AsyncMock(return_value="Texto formal.")):
         async with AsyncClient(app=app, base_url="http://test") as client:
-            r = await client.post(
-                "/webhook",
-                json=_text_payload("el ascensor no funciona"),
-                headers={"x-hook-token": "test-secret"},
-            )
+            r = await client.post("/webhook", json=_text_payload("el ascensor no funciona"))
     assert r.status_code == 200
 
 
@@ -99,6 +72,28 @@ async def test_unauthorized_sender_is_silently_ignored():
             "timestamp": "1720547300",
         })
     mock_send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_authorized_lid_sender_is_accepted(monkeypatch):
+    """Sender identified by @lid (WhatsApp Linked ID) is accepted when AUTHORIZED_LID is set."""
+    from app.webhook import process_message
+    from app.config import get_settings
+
+    monkeypatch.setenv("AUTHORIZED_LID", "165596792655909@lid")
+    get_settings.cache_clear()
+
+    with patch("app.webhook.waha.send_text", AsyncMock(return_value=True)), \
+         patch("app.webhook.format_message", AsyncMock(return_value="Texto formal.")):
+        await process_message({
+            "from": "165596792655909@lid",
+            "fromMe": False,
+            "id": "msg-lid-001",
+            "body": "el ascensor no funciona",
+            "hasMedia": False,
+            "timestamp": "1720547400",
+        })
+    assert get_pending() is not None
 
 
 # ─── New text message flow ────────────────────────────────────────────────────
@@ -177,7 +172,7 @@ async def test_ok_with_pending_publishes_to_group():
         await process_message(_text_payload("ok", msg_id="msg-confirm")["payload"])
 
     calls = [c[0] for c in mock_send.call_args_list]
-    group_calls = [c for c in calls if c[0] == "120363409010865500@g.us"]
+    group_calls = [c for c in calls if c[0] == "120363000000000001@g.us"]
     assert len(group_calls) == 1
     assert group_calls[0][1] == "Texto formal."
     assert get_pending() is None
@@ -230,7 +225,7 @@ async def test_non_keyword_message_does_not_trigger_confirm():
 
     # Should have replied "tenés un borrador pendiente", NOT published to group
     calls = [c[0] for c in mock_send.call_args_list]
-    group_calls = [c for c in calls if c[0] == "120363409010865500@g.us"]
+    group_calls = [c for c in calls if c[0] == "120363000000000001@g.us"]
     assert len(group_calls) == 0
 
 
@@ -257,6 +252,7 @@ async def test_unsupported_media_type_sends_error():
 
 
 # ─── PDF flow ─────────────────────────────────────────────────────────────────
+
 
 @pytest.mark.asyncio
 async def test_pdf_received_downloads_and_creates_draft(isolated_db):
@@ -296,7 +292,7 @@ async def test_pdf_confirm_publishes_to_group(isolated_db, tmp_path):
         await process_message(_text_payload("ok", msg_id="confirm-pdf")["payload"])
 
     mock_send_file.assert_called_once()
-    assert mock_send_file.call_args[0][0] == "120363409010865500@g.us"
+    assert mock_send_file.call_args[0][0] == "120363000000000001@g.us"
     assert get_pending() is None
 
 
@@ -318,3 +314,74 @@ async def test_pdf_confirm_file_missing_sends_error(isolated_db):
 
     mock_send_file.assert_not_called()
     assert "ya no está disponible" in mock_send.call_args[0][1]
+
+
+# ─── Google Sheets / gastos comunes flow ─────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("keyword", [
+    "gastos comunes",
+    "Gastos Comunes",
+    "GASTOS COMUNES",
+    "ya están los gastos comunes",
+    "subí los gastos comunes",
+    "ya cargué los gastos comunes del mes",
+])
+async def test_gastos_keyword_triggers_sheet_export(isolated_db, tmp_path, keyword, monkeypatch):
+    from app.webhook import process_message
+    from app.config import get_settings
+
+    monkeypatch.setenv("GOOGLE_CREDENTIALS_PATH", "/app/credentials.json")
+    monkeypatch.setenv("SHEET_ID", "fake-sheet-id")
+    monkeypatch.setenv("MEDIA_DIR", str(tmp_path))
+    get_settings.cache_clear()
+
+    fake_pdf = b"%PDF-1.4 fake"
+    with patch("app.webhook.sheets.export_sheet_as_pdf", AsyncMock(return_value=fake_pdf)) as mock_export, \
+         patch("app.webhook.waha.send_file", AsyncMock(return_value=True)) as mock_send_file, \
+         patch("app.webhook.waha.send_text", AsyncMock(return_value=True)) as mock_send:
+        await process_message(_text_payload(keyword, msg_id="gastos-001")["payload"])
+
+    mock_export.assert_called_once_with("fake-sheet-id", "/app/credentials.json", [])
+    mock_send_file.assert_called_once()
+    assert mock_send_file.call_args[0][0] == "549TEST1@c.us"  # preview goes to father
+    pending = get_pending()
+    assert pending is not None
+    assert pending["type"] == "pdf"
+    assert "ok" in mock_send.call_args[0][1].lower()
+
+
+@pytest.mark.asyncio
+async def test_gastos_with_pending_blocks(isolated_db, monkeypatch):
+    from app.webhook import process_message
+    from app.config import get_settings
+
+    monkeypatch.setenv("GOOGLE_CREDENTIALS_PATH", "/app/credentials.json")
+    monkeypatch.setenv("SHEET_ID", "fake-sheet-id")
+    get_settings.cache_clear()
+
+    insert_pending("existing", "text", raw_text="prev", formatted_text="Prev formal.")
+
+    with patch("app.webhook.sheets.export_sheet_as_pdf", AsyncMock()) as mock_export, \
+         patch("app.webhook.waha.send_text", AsyncMock(return_value=True)) as mock_send:
+        await process_message(_text_payload("gastos comunes", msg_id="gastos-002")["payload"])
+
+    mock_export.assert_not_called()
+    assert "borrador pendiente" in mock_send.call_args[0][1].lower()
+
+
+@pytest.mark.asyncio
+async def test_gastos_sheet_api_failure_sends_error(isolated_db, monkeypatch):
+    from app.webhook import process_message
+    from app.config import get_settings
+
+    monkeypatch.setenv("GOOGLE_CREDENTIALS_PATH", "/app/credentials.json")
+    monkeypatch.setenv("SHEET_ID", "fake-sheet-id")
+    get_settings.cache_clear()
+
+    with patch("app.webhook.sheets.export_sheet_as_pdf", AsyncMock(side_effect=Exception("403 Forbidden"))), \
+         patch("app.webhook.waha.send_text", AsyncMock(return_value=True)) as mock_send:
+        await process_message(_text_payload("gastos comunes", msg_id="gastos-003")["payload"])
+
+    assert "Google Sheets" in mock_send.call_args[0][1]
+    assert get_pending() is None

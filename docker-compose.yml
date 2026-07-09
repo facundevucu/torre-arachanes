@@ -11,6 +11,7 @@ services:
     environment:
       - WAHA_DEFAULT_ENGINE=NOWEB
       - WAHA_LOG_LEVEL=info
+      - WHATSAPP_HOOK_EVENTS=message
 
   backend:
     build: .
@@ -21,9 +22,11 @@ services:
       - WAHA_BASE_URL=http://waha:3000
       - MEDIA_DIR=/app/media
       - DB_PATH=/app/data/bot.db
+      - GOOGLE_CREDENTIALS_PATH=/app/credentials.json
     volumes:
       - bot_media:/app/media
       - bot_db:/app/data
+      - ./credentials.json:/app/credentials.json:ro
     depends_on:
       - waha
 

@@ -5,3 +5,5 @@ __pycache__/
 ssh-key-*.key
 ssh-key-*.key.pub
 .pytest_cache/
+torre-arachanes-*.json
+credentials.json
