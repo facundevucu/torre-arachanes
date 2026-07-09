@@ -1,0 +1,33 @@
+services:
+  waha:
+    image: devlikeapro/waha
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - waha_sessions:/app/.sessions
+    env_file:
+      - .env
+    environment:
+      - WAHA_DEFAULT_ENGINE=NOWEB
+      - WAHA_LOG_LEVEL=info
+
+  backend:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - WAHA_BASE_URL=http://waha:3000
+      - MEDIA_DIR=/app/media
+      - DB_PATH=/app/data/bot.db
+    volumes:
+      - bot_media:/app/media
+      - bot_db:/app/data
+    depends_on:
+      - waha
+
+volumes:
+  waha_sessions:
+  bot_media:
+  bot_db:
