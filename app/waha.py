@@ -101,6 +101,38 @@ async def get_session_status() -> str:
             return "UNKNOWN"
 
 
+async def configure_session_webhook(webhook_url: str, token: str) -> bool:
+    """PATCH the WAHA session to register the webhook with an explicit X-Hook-Token header.
+
+    Safe to call on every restart — WAHA replaces the webhook list, so it's idempotent.
+    Handles WAHA Core not supporting per-session webhooks gracefully (logs warning, returns False).
+    """
+    payload = {
+        "config": {
+            "webhooks": [
+                {
+                    "url": webhook_url,
+                    "events": ["message"],
+                    "customHeaders": [{"name": "X-Hook-Token", "value": token}],
+                }
+            ]
+        }
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            r = await client.patch(
+                f"{_base_url()}/api/sessions/default",
+                json=payload,
+                headers=_headers(),
+            )
+            r.raise_for_status()
+            logger.info("WAHA session webhook configured → %s", webhook_url)
+            return True
+        except Exception as exc:
+            logger.warning("configure_session_webhook failed: %s", exc)
+            return False
+
+
 async def get_messages_since(from_timestamp: Optional[str]) -> list:
     """Fetch recent messages for the default session.
 

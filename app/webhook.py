@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from datetime import datetime
 
-from . import waha
+from . import sheets, waha
 from .claude import format_message
 from .config import get_settings
 from .db import (
@@ -43,7 +43,11 @@ async def process_message(payload: dict) -> None:
 
     settings = get_settings()
 
-    if from_number != settings.AUTHORIZED_NUMBER:
+    authorized_ids = set(settings.AUTHORIZED_NUMBERS)
+    if settings.AUTHORIZED_LID:
+        authorized_ids.add(settings.AUTHORIZED_LID)
+
+    if from_number not in authorized_ids:
         logger.info("Ignored message from %s (not authorized)", from_number)
         return
 
@@ -70,6 +74,10 @@ async def _handle_text(msg_id: str, body: str, from_number: str) -> None:
 
     if lower in CANCEL_KEYWORDS:
         await _cancel(from_number)
+        return
+
+    if "gastos comunes" in lower:
+        await _handle_gastos_comunes(msg_id, from_number)
         return
 
     pending = get_pending()
@@ -165,7 +173,65 @@ async def _cancel(from_number: str) -> None:
     await waha.send_text(from_number, "Descartado. Podés mandar otro mensaje cuando quieras.")
 
 
-# ─── PDF flow ─────────────────────────────────────────────────────────────────
+# ─── Google Sheets flow ──────────────────────────────────────────────────────
+
+async def _handle_gastos_comunes(msg_id: str, from_number: str) -> None:
+    settings = get_settings()
+
+    pending = get_pending()
+    if pending:
+        await waha.send_text(
+            from_number,
+            "Tenés un borrador pendiente. Respondé 'ok' para publicar o 'cancelar' para descartar.",
+        )
+        return
+
+    if not settings.GOOGLE_CREDENTIALS_PATH or not settings.SHEET_ID:
+        logger.error("Google Sheets not configured — GOOGLE_CREDENTIALS_PATH or SHEET_ID missing")
+        await waha.send_text(from_number, "La integración con Google Sheets no está configurada.")
+        return
+
+    try:
+        pdf_bytes = await sheets.export_sheet_as_pdf(settings.SHEET_ID, settings.GOOGLE_CREDENTIALS_PATH, settings.SHEET_GIDS)
+    except Exception as exc:
+        logger.error("Google Sheets export failed: %s", exc)
+        await waha.send_text(
+            from_number,
+            "No pude obtener la planilla de Google Sheets. "
+            "Revisá que esté compartida con la cuenta de servicio y volvé a mandar 'gastos comunes'.",
+        )
+        return
+
+    pdf_path = os.path.join(settings.MEDIA_DIR, f"{msg_id}.pdf")
+    with open(pdf_path, "wb") as fh:
+        fh.write(pdf_bytes)
+
+    now = datetime.now(_ARG_TZ)
+    billing_month = now.month - 1 if now.month > 1 else 12
+    billing_year = now.year if now.month > 1 else now.year - 1
+    caption = (
+        f"Se adjunta la liquidación de gastos comunes correspondiente "
+        f"al mes de *{_spanish_month(billing_month)}* {billing_year}."
+    )
+
+    inserted = insert_pending(
+        message_id=msg_id,
+        msg_type="pdf",
+        local_pdf_path=pdf_path,
+        formatted_text=caption,
+    )
+    if not inserted:
+        logger.warning("Duplicate message_id %s — ignoring", msg_id)
+        return
+
+    await waha.send_file(from_number, pdf_path, caption)
+    await waha.send_text(
+        from_number,
+        "Respondé 'ok' para publicar el PDF al grupo o 'cancelar' para descartar.",
+    )
+
+
+# ─── Media flow (PDF only) ───────────────────────────────────────────────────
 
 async def _handle_media(
     msg_id: str, mimetype: str, media_url: str, from_number: str
@@ -173,7 +239,8 @@ async def _handle_media(
     if mimetype != "application/pdf":
         await waha.send_text(
             from_number,
-            "Solo acepto texto o PDF de gastos comunes. Este tipo de archivo no está soportado.",
+            "Solo acepto texto o el PDF de gastos comunes. "
+            "Este tipo de archivo no está soportado.",
         )
         return
 
@@ -186,36 +253,35 @@ async def _handle_media(
         return
 
     settings = get_settings()
-    dest = os.path.join(settings.MEDIA_DIR, f"{msg_id}.pdf")
+    download_dest = os.path.join(settings.MEDIA_DIR, f"{msg_id}.pdf")
 
-    ok = await waha.download_media(media_url, dest)
+    ok = await waha.download_media(media_url, download_dest)
     if not ok:
-        await waha.send_text(
-            from_number,
-            "No pude descargar el PDF. Por favor reenviálo.",
-        )
+        await waha.send_text(from_number, "No pude descargar el archivo. Por favor reenviálo.")
         return
 
     now = datetime.now(_ARG_TZ)
-    month_name = _spanish_month(now.month)
+    billing_month = now.month - 1 if now.month > 1 else 12
+    billing_year = now.year if now.month > 1 else now.year - 1
     caption = (
         f"Se adjunta la liquidación de gastos comunes correspondiente "
-        f"al mes de {month_name} {now.year}."
+        f"al mes de *{_spanish_month(billing_month)}* {billing_year}."
     )
 
     inserted = insert_pending(
         message_id=msg_id,
         msg_type="pdf",
-        local_pdf_path=dest,
+        local_pdf_path=download_dest,
         formatted_text=caption,
     )
     if not inserted:
-        logger.warning("Duplicate PDF message_id %s — ignoring", msg_id)
+        logger.warning("Duplicate media message_id %s — ignoring", msg_id)
         return
 
     await waha.send_text(
         from_number,
-        f"[BORRADOR PARA EL GRUPO]\n\n{caption}\n\nRespondé 'ok' para reenviar el PDF al grupo o 'cancelar' para descartar.",
+        f"[BORRADOR PARA EL GRUPO]\n\n{caption}\n\n"
+        "Respondé 'ok' para reenviar el PDF al grupo o 'cancelar' para descartar.",
     )
 
 

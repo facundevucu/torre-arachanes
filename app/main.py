@@ -1,7 +1,8 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 
 from .db import init_db
 from .startup import run_startup_recovery
@@ -18,7 +19,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     init_db()
     logger.info("Database initialized.")
-    await run_startup_recovery()
+    # Run recovery in background so the /webhook endpoint is available immediately.
+    # Recovery polls WAHA up to 120s; webhooks from WAHA must not be blocked during that wait.
+    asyncio.create_task(run_startup_recovery())
     yield
 
 
@@ -29,14 +32,9 @@ app = FastAPI(lifespan=lifespan)
 async def webhook(
     request: Request,
     background_tasks: BackgroundTasks,
-    x_hook_token: str = Header(default=""),
 ) -> dict:
-    from .config import get_settings
-
-    if x_hook_token != get_settings().WEBHOOK_SECRET:
-        logger.warning("Webhook received with invalid token.")
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
+    # No token auth: backend has no external port — Docker internal network is
+    # the security boundary. WAHA Core global-env webhooks don't send auth headers.
     body = await request.json()
 
     # Only process incoming messages (not status events, not sent-by-bot)
