@@ -101,56 +101,32 @@ async def get_session_status() -> str:
             return "UNKNOWN"
 
 
-async def configure_session_webhook(webhook_url: str, token: str) -> bool:
-    """PATCH the WAHA session to register the webhook with an explicit X-Hook-Token header.
+async def get_messages_since(chat_id: str, from_timestamp: Optional[str]) -> list:
+    """Fetch recent messages from a single chat for the default session.
 
-    Safe to call on every restart — WAHA replaces the webhook list, so it's idempotent.
-    Handles WAHA Core not supporting per-session webhooks gracefully (logs warning, returns False).
+    Uses WAHA's GET /api/messages, which (as of WAHA 2026.7) requires both
+    ``session`` and ``chatId``. The previous ``/api/{session}/messages`` route
+    was removed. Returns an empty list on any error (best-effort — T3).
     """
-    payload = {
-        "config": {
-            "webhooks": [
-                {
-                    "url": webhook_url,
-                    "events": ["message"],
-                    "customHeaders": [{"name": "X-Hook-Token", "value": token}],
-                }
-            ]
-        }
+    params: dict = {
+        "session": "default",
+        "chatId": chat_id,
+        "limit": 100,
+        "downloadMedia": "false",
     }
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            r = await client.patch(
-                f"{_base_url()}/api/sessions/default",
-                json=payload,
-                headers=_headers(),
-            )
-            r.raise_for_status()
-            logger.info("WAHA session webhook configured → %s", webhook_url)
-            return True
-        except Exception as exc:
-            logger.warning("configure_session_webhook failed: %s", exc)
-            return False
-
-
-async def get_messages_since(from_timestamp: Optional[str]) -> list:
-    """Fetch recent messages for the default session.
-
-    Returns an empty list on any error (best-effort — T3).
-    """
-    params: dict = {"limit": 100, "downloadMedia": "false"}
     if from_timestamp:
-        params["fromTimestamp"] = from_timestamp
+        # WAHA filters by Unix-seconds timestamp; our cursor is stored in seconds.
+        params["filter.timestamp.gte"] = from_timestamp
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             r = await client.get(
-                f"{_base_url()}/api/default/messages",
+                f"{_base_url()}/api/messages",
                 params=params,
                 headers=_headers(),
             )
             r.raise_for_status()
             return r.json() or []
         except Exception as exc:
-            logger.warning("get_messages_since failed: %s", exc)
+            logger.warning("get_messages_since failed for %s: %s", chat_id, exc)
             return []

@@ -385,3 +385,67 @@ async def test_gastos_sheet_api_failure_sends_error(isolated_db, monkeypatch):
 
     assert "Google Sheets" in mock_send.call_args[0][1]
     assert get_pending() is None
+
+
+# ─── Concurrent messages ─────────────────────────────────────────────────────
+
+async def test_two_simultaneous_messages_create_one_draft():
+    """Both used to pass the pending check while Claude was still running."""
+    from app.db import _connect
+    from app.webhook import process_message
+
+    async def slow_format(_text):
+        await asyncio.sleep(0.01)
+        return "formateado"
+
+    first = _text_payload("primero", msg_id="c-1")["payload"]
+    second = _text_payload("segundo", msg_id="c-2")["payload"]
+    with patch("app.webhook.format_message", slow_format), \
+         patch("app.waha.send_text", AsyncMock(return_value=True)) as send_text:
+        await asyncio.gather(process_message(first), process_message(second))
+
+    with _connect() as conn:
+        rows = conn.execute("SELECT message_id FROM pending_approvals WHERE status='pending'").fetchall()
+    assert [r["message_id"] for r in rows] == ["c-1"]
+    assert "borrador pendiente" in send_text.await_args_list[1].args[1]
+
+
+async def test_publishing_resolves_only_the_published_draft():
+    """A draft that was never sent must not end up marked as published."""
+    from app.db import _connect
+    from app.webhook import process_message
+
+    insert_pending("old", "text", raw_text="a", formatted_text="viejo")
+    with _connect() as conn:
+        conn.execute("UPDATE pending_approvals SET created_at='2000-01-01' WHERE message_id='old'")
+    insert_pending("new", "text", raw_text="b", formatted_text="nuevo")
+
+    with patch("app.waha.send_text", AsyncMock(return_value=True)):
+        await process_message(_text_payload("ok", msg_id="ok-1")["payload"])
+
+    with _connect() as conn:
+        status = dict(conn.execute("SELECT message_id, status FROM pending_approvals").fetchall())
+    assert status == {"old": "pending", "new": "published"}
+
+
+async def test_duplicate_command_is_ignored():
+    """WAHA can deliver the same 'ok' twice; the second must send nothing."""
+    from app.webhook import process_message
+
+    payload = _text_payload("ok", msg_id="dup-ok")["payload"]
+    with patch("app.waha.send_text", AsyncMock(return_value=True)) as send_text:
+        await process_message(payload)
+        await process_message(payload)
+    assert send_text.await_count == 1
+
+
+async def test_failed_message_can_be_retried():
+    from app.webhook import process_message
+
+    payload = _text_payload("aviso", msg_id="retry-1")["payload"]
+    with patch("app.webhook.format_message", AsyncMock(side_effect=RuntimeError("boom"))):
+        await process_message(payload)
+    with patch("app.webhook.format_message", AsyncMock(return_value="formateado")), \
+         patch("app.waha.send_text", AsyncMock(return_value=True)) as send_text:
+        await process_message(payload)
+    assert send_text.await_count == 1

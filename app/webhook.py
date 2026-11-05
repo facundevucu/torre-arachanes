@@ -16,6 +16,8 @@ from .config import get_settings
 from .db import (
     get_pending,
     insert_pending,
+    is_processed,
+    mark_processed,
     resolve_pending,
     set_last_processed_at,
 )
@@ -25,6 +27,10 @@ logger = logging.getLogger(__name__)
 CONFIRM_KEYWORDS = {"ok", "si", "sí"}
 CANCEL_KEYWORDS = {"cancelar", "cancel"}
 _ARG_TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+
+# One message at a time. The pending-draft check and the insert are seconds apart
+# (Claude runs in between), so concurrent messages would each create a draft.
+_process_lock = asyncio.Lock()
 
 
 async def process_message(payload: dict) -> None:
@@ -51,16 +57,23 @@ async def process_message(payload: dict) -> None:
         logger.info("Ignored message from %s (not authorized)", from_number)
         return
 
-    try:
-        if has_media:
-            await _handle_media(msg_id, mimetype, media_url, from_number)
-        else:
-            await _handle_text(msg_id, body, from_number)
-        if timestamp:
-            set_last_processed_at(timestamp)
-    except Exception:
-        logger.exception("Unhandled error processing message %s", msg_id)
-        # Do not update cursor — message will be retried on next startup recovery
+    async with _process_lock:
+        if msg_id and is_processed(msg_id):
+            logger.info("Skipping already processed message %s", msg_id)
+            return
+
+        try:
+            if has_media:
+                await _handle_media(msg_id, mimetype, media_url, from_number)
+            else:
+                await _handle_text(msg_id, body, from_number)
+            if msg_id:
+                mark_processed(msg_id)
+            if timestamp:
+                set_last_processed_at(timestamp)
+        except Exception:
+            logger.exception("Unhandled error processing message %s", msg_id)
+            # Do not update cursor — message will be retried on next startup recovery
 
 
 # ─── Text flow ───────────────────────────────────────────────────────────────
@@ -137,7 +150,7 @@ async def _confirm(from_number: str) -> None:
 async def _publish_text(from_number: str, pending: dict, settings) -> None:
     ok = await waha.send_text(settings.GROUP_JID, pending["formatted_text"])
     if ok:
-        resolve_pending("published")
+        resolve_pending(pending["id"], "published")
         await waha.send_text(from_number, "✓ Publicado en el grupo.")
     else:
         await waha.send_text(from_number, "Error al publicar en el grupo. Intentá de nuevo.")
@@ -148,7 +161,7 @@ async def _publish_pdf(from_number: str, pending: dict, settings) -> None:
 
     # File-existence check (T2 / cross-model tension resolved)
     if not path or not os.path.exists(path):
-        resolve_pending("error")
+        resolve_pending(pending["id"], "error")
         await waha.send_text(
             from_number,
             "El PDF ya no está disponible. Por favor reenviálo.",
@@ -158,7 +171,7 @@ async def _publish_pdf(from_number: str, pending: dict, settings) -> None:
     caption = pending["formatted_text"]  # caption was stored in formatted_text for PDFs
     ok = await waha.send_file(settings.GROUP_JID, path, caption)
     if ok:
-        resolve_pending("published")
+        resolve_pending(pending["id"], "published")
         await waha.send_text(from_number, "✓ PDF enviado al grupo.")
     else:
         await waha.send_text(from_number, "Error al enviar el PDF. Intentá de nuevo.")
@@ -169,7 +182,7 @@ async def _cancel(from_number: str) -> None:
     if not pending:
         await waha.send_text(from_number, "No hay borrador pendiente.")
         return
-    resolve_pending("cancelled")
+    resolve_pending(pending["id"], "cancelled")
     await waha.send_text(from_number, "Descartado. Podés mandar otro mensaje cuando quieras.")
 
 

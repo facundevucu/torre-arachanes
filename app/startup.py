@@ -4,8 +4,8 @@ import logging
 
 from . import waha
 from .config import get_settings
-from .db import get_last_processed_at, get_pending
-from .webhook import process_message
+from .db import get_last_processed_at, get_pending, is_processed
+from .webhook import CANCEL_KEYWORDS, CONFIRM_KEYWORDS, process_message
 
 logger = logging.getLogger(__name__)
 
@@ -47,36 +47,29 @@ async def run_startup_recovery() -> None:
 
     logger.info("WAHA session is WORKING.")
 
-    # 2. Register webhook on the WAHA session (idempotent — survives session recreation).
-    #    Uses customHeaders to send exactly X-Hook-Token, avoiding WHATSAPP_HOOK_TOKEN
-    #    header-name ambiguity across WAHA versions.
-    await waha.configure_session_webhook(settings.WEBHOOK_ENDPOINT_URL, settings.WEBHOOK_SECRET)
+    # The webhook is registered globally via the WHATSAPP_HOOK_URL env var (set in
+    # the server's .env); WAHA delivers `message` events to /webhook with no auth
+    # header, which is exactly what app.main.webhook expects. We deliberately do NOT
+    # also register a per-session webhook — that would double-deliver every message.
 
-    # 3. Load cursor
+    # 2. Load cursor. Without one we cannot tell old messages from missed ones, so
+    #    replaying would re-answer the whole chat history.
     last_ts = get_last_processed_at()
     logger.info("Last processed timestamp: %s", last_ts or "never")
 
-    # 3. Fetch missed messages (best-effort — T3)
-    messages = await waha.get_messages_since(last_ts)
+    if not last_ts:
+        for jid in settings.AUTHORIZED_NUMBERS:
+            await waha.send_text(
+                jid,
+                "Bot reiniciado. Si mandaste mensajes mientras estaba caído, reenviálos.",
+            )
+        return
 
-    # Filter to authorized sender only (accept both @c.us and @lid), exclude fromMe
-    authorized_ids = set(settings.AUTHORIZED_NUMBERS)
-    if settings.AUTHORIZED_LID:
-        authorized_ids.add(settings.AUTHORIZED_LID)
-    missed = [
-        m for m in messages
-        if m.get("from") in authorized_ids and not m.get("fromMe", False)
-    ]
+    # 3. Fetch missed messages (best-effort — T3)
+    missed = await _collect_missed(settings, last_ts)
 
     if not missed:
-        if last_ts:
-            logger.info("No missed messages since last run.")
-        else:
-            for jid in settings.AUTHORIZED_NUMBERS:
-                await waha.send_text(
-                    jid,
-                    "Bot reiniciado. Si mandaste mensajes mientras estaba caído, reenviálos.",
-                )
+        logger.info("No missed messages since last run.")
         return
 
     logger.info("Found %d missed message(s).", len(missed))
@@ -97,3 +90,38 @@ async def run_startup_recovery() -> None:
     logger.info("Replaying %d missed message(s).", len(missed))
     for msg in missed:
         await process_message(msg)
+
+
+async def _collect_missed(settings, last_ts: str) -> list:
+    """Return the messages to replay, oldest first.
+
+    WAHA's GET /api/messages requires a chatId. The @c.us and @lid chats return the
+    same messages, so results are deduplicated by id. Its timestamp filter is `gte`,
+    so the cursor message comes back too and is dropped here.
+    """
+    authorized_ids = set(settings.AUTHORIZED_NUMBERS)
+    if settings.AUTHORIZED_LID:
+        authorized_ids.add(settings.AUTHORIZED_LID)
+
+    by_id: dict = {}
+    for chat_id in sorted(authorized_ids):
+        for message in await waha.get_messages_since(chat_id, last_ts):
+            by_id[message.get("id")] = message
+
+    cursor = float(last_ts)
+    missed = [
+        m for m in by_id.values()
+        if m.get("from") in authorized_ids
+        and not m.get("fromMe", False)
+        and float(m.get("timestamp") or 0) > cursor
+        and not is_processed(m.get("id") or "")
+        and not _is_command(m)
+    ]
+    return sorted(missed, key=lambda m: float(m.get("timestamp") or 0))
+
+
+def _is_command(message: dict) -> bool:
+    """Commands answer a draft the sender saw at the time. Replaying one after a
+    restart could publish a draft nobody has read, so they are never replayed."""
+    body = (message.get("body") or "").strip().lower()
+    return body in CONFIRM_KEYWORDS or body in CANCEL_KEYWORDS

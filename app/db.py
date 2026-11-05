@@ -29,6 +29,10 @@ def init_db() -> None:
                 last_processed_at   TEXT
             );
             INSERT OR IGNORE INTO bot_state(id, last_processed_at) VALUES(1, NULL);
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                message_id    TEXT PRIMARY KEY,
+                processed_at  TEXT NOT NULL
+            );
         """)
 
 
@@ -83,11 +87,29 @@ def insert_pending(
         return False
 
 
-def resolve_pending(status: str) -> None:
+def resolve_pending(pending_id: int, status: str) -> None:
+    """Resolve one draft. Never resolve by status alone: that would mark drafts
+    that were not sent as published."""
     with _connect() as conn:
         conn.execute(
-            "UPDATE pending_approvals SET status=?, resolved_at=? WHERE status='pending'",
-            (status, datetime.now(timezone.utc).isoformat()),
+            "UPDATE pending_approvals SET status=?, resolved_at=? WHERE id=? AND status='pending'",
+            (status, datetime.now(timezone.utc).isoformat(), pending_id),
+        )
+
+
+def is_processed(message_id: str) -> bool:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM processed_messages WHERE message_id=?", (message_id,)
+        ).fetchone()
+        return row is not None
+
+
+def mark_processed(message_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_messages(message_id, processed_at) VALUES(?, ?)",
+            (message_id, datetime.now(timezone.utc).isoformat()),
         )
 
 

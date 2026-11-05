@@ -27,7 +27,7 @@ def test_insert_duplicate_returns_false():
 
 def test_resolve_published():
     insert_pending("m1", "text", raw_text="r", formatted_text="f")
-    resolve_pending("published")
+    resolve_pending(get_pending()["id"], "published")
     assert get_pending() is None
 
     from app.db import _connect
@@ -38,7 +38,7 @@ def test_resolve_published():
 
 def test_resolve_cancelled():
     insert_pending("m1", "text", raw_text="r", formatted_text="f")
-    resolve_pending("cancelled")
+    resolve_pending(get_pending()["id"], "cancelled")
     assert get_pending() is None
 
 

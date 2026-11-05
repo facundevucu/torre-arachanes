@@ -172,6 +172,6 @@ uvicorn app.main:app --reload
 ## Seguridad
 
 - Solo mensajes del/los número(s) en `AUTHORIZED_NUMBER` son procesados; el resto se ignora silenciosamente.
-- El webhook del backend requiere el header `X-Hook-Token` (configurado vía `WEBHOOK_SECRET`).
+- El webhook del backend no usa autenticación: no expone ningún puerto y solo es accesible desde la red interna de Docker.
 - El contenedor de Docker corre en red privada; el backend no está expuesto a internet directamente.
 - Las credenciales de Google Cloud y el archivo `.env` están en `.gitignore` y nunca se commitean.
